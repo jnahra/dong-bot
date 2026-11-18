@@ -1,0 +1,94 @@
+name: Would it dong
+
+# Every 30 minutes from March through November this checks MLB's schedule.
+# If a Guardians road game is live or starts within 45 minutes, it watches
+# the game until it's over; otherwise it exits in under a minute.
+on:
+  schedule:
+    - cron: "7,37 * * 3-11 *"   # every 30 min, Mar-Nov (times are UTC)
+    - cron: "17 15 1 * *"         # 1st of every month: keepalive commit
+  workflow_dispatch:
+    inputs:
+      replay_game:
+        description: "Test: replay a finished game as a dry run (gamePk, e.g. 824055). Leave empty to watch live games."
+        required: false
+        default: ""
+
+permissions:
+  contents: write   # to commit bot-state/ back to the repo
+
+# Only one copy at a time. A run that fires mid-game waits its turn, then
+# exits quickly once it sees the game is over.
+concurrency:
+  group: dongbot
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    env:
+      # Repository variables (Settings > Secrets and variables > Actions > Variables).
+      # Posting stays off until you set DRY_RUN to false.
+      DRY_RUN: ${{ vars.DRY_RUN || 'true' }}
+      NEAR_WALL_FT: ${{ vars.NEAR_WALL_FT || '20' }}
+      BATTERS: ${{ vars.BATTERS || 'all' }}
+      MAX_POSTS_PER_GAME: ${{ vars.MAX_POSTS_PER_GAME || '12' }}
+      HASHTAG: ${{ vars.HASHTAG || '#GuardsBall' }}
+      HANDLE: ${{ vars.HANDLE }}
+      GAME_TYPES: ${{ vars.GAME_TYPES || 'R,F,D,L,W' }}
+      BACKFILL_MINUTES: "20"
+      STATE_FILE: bot-state/state.json
+      OUT_DIR: out
+      # Repository secrets.
+      X_API_KEY: ${{ secrets.X_API_KEY }}
+      X_API_SECRET: ${{ secrets.X_API_SECRET }}
+      X_ACCESS_TOKEN: ${{ secrets.X_ACCESS_TOKEN }}
+      X_ACCESS_SECRET: ${{ secrets.X_ACCESS_SECRET }}
+      REPLAY_GAME: ${{ inputs.replay_game }}
+      IS_REPLAY: ${{ github.event_name == 'workflow_dispatch' && inputs.replay_game != '' }}
+      IS_KEEPALIVE: ${{ github.event.schedule == '17 15 1 * *' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Replay a finished game (manual test, never posts)
+        if: env.IS_REPLAY == 'true'
+        run: python -m dongbot replay "$REPLAY_GAME"
+
+      - name: Watch Guardians road games
+        if: env.IS_REPLAY != 'true'
+        timeout-minutes: 345
+        run: python -m dongbot watch --max-minutes 330
+
+      - name: Save bot state
+        if: always() && env.IS_REPLAY != 'true'
+        run: |
+          mkdir -p bot-state
+          if [ "$IS_KEEPALIVE" = "true" ]; then date -u +%Y-%m-%dT%H:%MZ > bot-state/keepalive.txt; fi
+          git add bot-state
+          if git diff --cached --quiet; then echo "No state changes."; exit 0; fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "Update bot state"
+          for attempt in 1 2 3; do
+            git pull --rebase --quiet && git push && exit 0
+            sleep 5
+          done
+          exit 1
+
+      - name: Keep the cards for 14 days
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cards-${{ github.run_id }}
+          path: out/
+          if-no-files-found: ignore
+          retention-days: 14
